@@ -54,7 +54,7 @@ from sam3.train.transforms.basic_for_api import (
 from sam3.eval.postprocessors import PostProcessImage
 
 # LoRA imports
-from lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights
+from sam3_finetune_lora.lora.lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights
 
 
 class SAM3LoRAInference:
@@ -338,7 +338,8 @@ class SAM3LoRAInference:
         results: dict,
         output_path: str,
         show_boxes: bool = True,
-        show_masks: bool = True
+        show_masks: bool = True,
+        show_labels: bool = True
     ):
         """
         Visualize predictions on image.
@@ -416,15 +417,16 @@ class SAM3LoRAInference:
                     ax.add_patch(rect)
 
                     # Add label
-                    score = scores[i] if scores is not None else 0
-                    label = f"{prompt}: {score:.2f}"
-                    ax.text(
-                        x1, y1 - 5,
-                        label,
-                        bbox=dict(facecolor=color, alpha=0.5),
-                        fontsize=10,
-                        color='white'
-                    )
+                    if show_labels:
+                        score = scores[i] if scores is not None else 0
+                        label = f"{prompt}: {score:.2f}"
+                        ax.text(
+                            x1, y1 - 5,
+                            label,
+                            bbox=dict(facecolor=color, alpha=0.5),
+                            fontsize=10,
+                            color='white'
+                        )
 
         ax.axis('off')
 
@@ -486,15 +488,19 @@ def main():
         help="Input resolution (default: 1008)"
     )
     parser.add_argument(
-        "--boundingbox",
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help="Show bounding boxes: True or False (default: False)"
+        "--no-boxes",
+        action="store_true",
+        help="Don't show bounding boxes"
     )
     parser.add_argument(
         "--no-masks",
         action="store_true",
         help="Don't show segmentation masks"
+    )
+    parser.add_argument(
+        "--no-labels",
+        action="store_true",
+        help="Don't show labels on bounding boxes"
     )
     parser.add_argument(
         "--nms-iou",
@@ -521,8 +527,9 @@ def main():
     inferencer.visualize(
         results,
         args.output,
-        show_boxes=args.boundingbox,
-        show_masks=not args.no_masks
+        show_boxes=not args.no_boxes,
+        show_masks=not args.no_masks,
+        show_labels=not args.no_labels
     )
 
     # Print summary
