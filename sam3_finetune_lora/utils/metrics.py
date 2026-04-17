@@ -154,11 +154,11 @@ class DetectionMetricsEvaluator:
         target_boxes: torch.Tensor,
         target_labels: torch.Tensor,
     ) -> None:
-        pred_boxes = pred_boxes.detach()
-        pred_scores = pred_scores.detach()
-        pred_labels = pred_labels.detach()
-        target_boxes = target_boxes.detach()
-        target_labels = target_labels.detach()
+        pred_boxes = pred_boxes.detach().to(device="cpu", dtype=torch.float32)
+        pred_scores = pred_scores.detach().to(device="cpu", dtype=torch.float32)
+        pred_labels = pred_labels.detach().to(device="cpu", dtype=torch.int64)
+        target_boxes = target_boxes.detach().to(device="cpu", dtype=torch.float32)
+        target_labels = target_labels.detach().to(device="cpu", dtype=torch.int64)
 
         if pred_boxes.numel() == 0:
             tp = np.zeros((0, self.iouv.numel()), dtype=bool)
