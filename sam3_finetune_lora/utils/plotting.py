@@ -90,7 +90,7 @@ def plot_results(
         except Exception as e:
             LOGGER.error(f"Plotting error for {f}: {e}")
 
-    if loss_axes:
+    if loss_axes is not None:
         loss_axes[0].legend()
         loss_fname = save_dir / "results_losses.png"
         loss_fig.savefig(loss_fname, dpi=200)
@@ -98,7 +98,7 @@ def plot_results(
         if on_plot:
             on_plot(loss_fname)
 
-    if metric_axes:
+    if metric_axes is not None:
         metric_axes[0].legend()
         metric_fname = save_dir / "results_metrics.png"
         metric_fig.savefig(metric_fname, dpi=200)
