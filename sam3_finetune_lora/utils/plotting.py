@@ -4,12 +4,42 @@ from pathlib import Path
 
 from . import LOGGER
 
+LOSS_COLUMNS = [
+    "train/core_loss",
+    "train/loss_ce",
+    "train/presence_loss",
+    "train/loss_bbox",
+    "train/loss_giou",
+    "train/loss_mask",
+    "train/loss_dice",
+    "val/core_loss",
+    "val/loss_ce",
+    "val/presence_loss",
+    "val/loss_bbox",
+    "val/loss_giou",
+    "val/loss_mask",
+    "val/loss_dice",
+]
+
+METRIC_COLUMNS = [
+    "metrics/precision(B)",
+    "metrics/recall(B)",
+    "metrics/mAP50(B)",
+    "metrics/mAP50-95(B)",
+]
+
 
 def _make_figure(plt, columns, title):
     """Create a subplot grid sized for the number of columns to plot."""
     n = len(columns)
     if n == 0:
         return None, None
+
+    if columns == LOSS_COLUMNS:
+        fig, axes = plt.subplots(2, 7, figsize=(28, 8), tight_layout=True)
+        axes = axes.ravel()
+        fig.suptitle(title, fontsize=14)
+        return fig, axes
 
     ncols = min(4, n)
     nrows = math.ceil(n / ncols)
@@ -59,11 +89,8 @@ def plot_results(
         try:
             data = pl.read_csv(f, infer_schema_length=None)
             if i == 0:
-                for c in data.columns:
-                    if "loss" in c:
-                        loss_keys.append(c)
-                    elif "metric" in c:
-                        metric_keys.append(c)
+                loss_keys = [c for c in LOSS_COLUMNS if c in data.columns]
+                metric_keys = [c for c in METRIC_COLUMNS if c in data.columns]
                 loss_fig, loss_axes = _make_figure(plt, loss_keys, "Training and Validation Losses")
                 metric_fig, metric_axes = _make_figure(plt, metric_keys, "Validation Metrics")
             x = data.select(data.columns[0]).to_numpy().flatten()
