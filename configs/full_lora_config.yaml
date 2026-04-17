@@ -5,6 +5,7 @@
 # Model settings
 model:
   name: "facebook/sam3"
+  checkpoint_path: "/content/drive/MyDrive/TOW/finetune/sam3.pt"
   cache_dir: null
 
 # LoRA settings
@@ -52,18 +53,23 @@ lora:
     - "linear1"              # Transformer FFN first layer
     - "linear2"              # Transformer FFN second layer
 
-  # Apply LoRA to ALL components for maximum adaptation
-  apply_to_vision_encoder: true    # Vision backbone (ViT)
-  apply_to_text_encoder: true      # Language backbone (CLIP text encoder)
-  apply_to_geometry_encoder: true  # Geometry encoder for prompts
+  # Apply LoRA ONLY to DETR encoder and decoder
+  apply_to_vision_encoder: false   # Vision backbone (ViT)
+  apply_to_text_encoder: false     # Language backbone (CLIP text encoder)
+  apply_to_geometry_encoder: false # Geometry encoder for prompts
   apply_to_detr_encoder: true      # DETR-style transformer encoder
   apply_to_detr_decoder: true      # DETR-style transformer decoder
-  apply_to_mask_decoder: true      # Mask prediction head
+  apply_to_mask_decoder: false     # Mask prediction head
 
 # Training settings
 training:
-  data_dir: "/workspace/data"  # Root directory containing train/valid/test folders with COCO annotations
-  batch_size: 4      # Increased from 1 to reduce gradient variance
+  enable_segmentation: true
+  data_dir: "/content/drive/MyDrive/TOW/finetune/dataset"  # Root directory containing train/valid/test folders with COCO annotations
+  img_folder_train: "/content/drive/MyDrive/TOW/finetune/raw/train/images"
+  ann_file_train: "/content/drive/MyDrive/TOW/finetune/raw/train/annotations/instances_train.json"
+  img_folder_val: "/content/drive/MyDrive/TOW/finetune/raw/val/images"
+  ann_file_val: "/content/drive/MyDrive/TOW/finetune/raw/val/annotations/instances_val.json"
+  batch_size: 2      # Increased from 1 to reduce gradient variance
   num_workers: 2        # Increase for better data loading
 
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
@@ -73,7 +79,7 @@ training:
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 100       # Reduced from 500 (small dataset overfits quickly)
+  num_epochs: 10       # Reduced from 500 (small dataset overfits quickly)
   warmup_steps: 200     # Reduced from 1000 (proportional to dataset size)
   lr_scheduler: "cosine"
 
@@ -87,8 +93,8 @@ training:
   gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
 
 output:
-  output_dir: "outputs/sam3_lora_full"
-  logging_dir: "logs"
+  output_dir: "/content/drive/MyDrive/TOW/finetune/outputs/sam3_lora_full"
+  logging_dir: "/content/drive/MyDrive/TOW/finetune/outputs/logs"
   save_lora_only: true
   push_to_hub: false
   hub_model_id: null
@@ -102,3 +108,46 @@ hardware:
   device: "cuda"
   dataloader_pin_memory: true
   use_compile: false
+
+# ============================================================================
+# Loss Configuration
+# ============================================================================
+loss:
+  _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
+  matcher: ${scratch.matcher}
+  o2m_weight: 2.0
+  o2m_matcher:
+    _target_: sam3.train.matcher.BinaryOneToManyMatcher
+    alpha: 0.3
+    threshold: 0.4
+    topk: 4
+  use_o2m_matcher_on_o2m_aux: false
+
+  # Loss functions for detection
+  loss_fns_find:
+    - _target_: sam3.train.loss.loss_fns.Boxes
+      weight_dict:
+        loss_bbox: 5.0
+        loss_giou: 2.0
+
+    - _target_: sam3.train.loss.loss_fns.IABCEMdetr
+      weak_loss: false
+      weight_dict:
+        loss_ce: 20.0
+        presence_loss: 20.0
+      pos_weight: 10.0
+      alpha: 0.25
+      gamma: 2
+      use_presence: true
+      pos_focal: false
+      pad_n_queries: 200
+      pad_scale_pos: 1.0
+
+    # Mask loss (enabled if training.enable_segmentation is true)
+    - _target_: sam3.train.loss.loss_fns.Masks
+      focal_alpha: 0.25
+      focal_gamma: 2.0
+      weight_dict:
+        loss_mask: 0.0 # 200.0
+        loss_dice: 0.0 # 10.0
+      compute_aux: false
