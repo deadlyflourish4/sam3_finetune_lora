@@ -54,7 +54,6 @@ from sam3.train.utils.train_utils import (
     setup_distributed_backend,
 )
 
-
 CORE_LOSS_KEY = "core_loss"
 
 

@@ -11,7 +11,6 @@ from typing import Any, get_args, get_origin, List, Mapping, Optional, Sequence,
 
 import torch
 
-
 MyTensor = Union[torch.Tensor, List[Any]]
 
 

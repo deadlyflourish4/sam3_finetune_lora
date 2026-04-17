@@ -7,7 +7,6 @@ from typing import Dict, List, Tuple
 import torch
 from pycocotools import mask as mask_util
 
-
 # ============================================================================
 # Utility Functions
 # ============================================================================

@@ -24,7 +24,6 @@ from .mask_sampling import (
     point_sample,
 )
 
-
 CORE_LOSS_KEY = "core_loss"
 
 
@@ -325,7 +324,9 @@ class IABCEMdetr(LossWithWeights):
         if num_det_queries is not None:
             logging.warning("note: it's not needed to set num_det_queries anymore")
         if self.use_separate_loss_for_det_and_trk:
-            assert not self.weak_loss, "Do not use weak_loss in this case -- set separate loss for detection and tracking queries instead"
+            assert (
+                not self.weak_loss
+            ), "Do not use weak_loss in this case -- set separate loss for detection and tracking queries instead"
             self.det_exhaustive_loss_scale_pos = det_exhaustive_loss_scale_pos
             self.det_exhaustive_loss_scale_neg = det_exhaustive_loss_scale_neg
             self.det_non_exhaustive_loss_scale_pos = det_non_exhaustive_loss_scale_pos
@@ -441,7 +442,9 @@ class IABCEMdetr(LossWithWeights):
                 pass
 
         if self.weak_loss:
-            assert not self.use_separate_loss_for_det_and_trk, "Do not use weak_loss in this case -- set separate loss for detection and tracking queries instead"
+            assert (
+                not self.use_separate_loss_for_det_and_trk
+            ), "Do not use weak_loss in this case -- set separate loss for detection and tracking queries instead"
 
             # nullify the negative loss for the non-exhaustive classes
             assert loss_bce.shape[0] == targets["is_exhaustive"].shape[0]

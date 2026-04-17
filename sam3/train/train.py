@@ -20,7 +20,6 @@ from omegaconf import OmegaConf
 from sam3.train.utils.train_utils import makedir, register_omegaconf_resolvers
 from tqdm import tqdm
 
-
 os.environ["HYDRA_FULL_ERROR"] = "1"
 
 

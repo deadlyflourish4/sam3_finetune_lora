@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Set, Tuple
 import math
 
+
 class MultiheadAttentionLoRA(nn.Module):
     """
     Custom MultiheadAttention that doesn't use F.multi_head_attention_forward,
@@ -37,7 +38,9 @@ class MultiheadAttentionLoRA(nn.Module):
         self.batch_first = batch_first
         self.dropout = dropout
 
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        assert (
+            self.head_dim * num_heads == embed_dim
+        ), "embed_dim must be divisible by num_heads"
 
         # Separate Q, K, V projections (instead of fused in_proj)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -49,13 +52,15 @@ class MultiheadAttentionLoRA(nn.Module):
         if in_proj_weight is not None:
             # Split in_proj_weight into q, k, v
             self.q_proj.weight.data = in_proj_weight[:embed_dim, :].clone()
-            self.k_proj.weight.data = in_proj_weight[embed_dim:2*embed_dim, :].clone()
-            self.v_proj.weight.data = in_proj_weight[2*embed_dim:, :].clone()
+            self.k_proj.weight.data = in_proj_weight[
+                embed_dim : 2 * embed_dim, :
+            ].clone()
+            self.v_proj.weight.data = in_proj_weight[2 * embed_dim :, :].clone()
 
         if in_proj_bias is not None:
             self.q_proj.bias.data = in_proj_bias[:embed_dim].clone()
-            self.k_proj.bias.data = in_proj_bias[embed_dim:2*embed_dim].clone()
-            self.v_proj.bias.data = in_proj_bias[2*embed_dim:].clone()
+            self.k_proj.bias.data = in_proj_bias[embed_dim : 2 * embed_dim].clone()
+            self.v_proj.bias.data = in_proj_bias[2 * embed_dim :].clone()
 
         if out_proj_weight is not None:
             self.out_proj.weight.data = out_proj_weight.clone()
@@ -121,7 +126,9 @@ class MultiheadAttentionLoRA(nn.Module):
                     attn_mask = attn_mask.unsqueeze(1)
                 elif attn_mask.shape[0] == batch_size * self.num_heads:
                     # (batch*num_heads, tgt_len, src_len) -> (batch, num_heads, tgt_len, src_len)
-                    attn_mask = attn_mask.view(batch_size, self.num_heads, tgt_len, src_len)
+                    attn_mask = attn_mask.view(
+                        batch_size, self.num_heads, tgt_len, src_len
+                    )
                 else:
                     # Unknown format, try to broadcast
                     attn_mask = attn_mask.unsqueeze(1)
@@ -134,7 +141,7 @@ class MultiheadAttentionLoRA(nn.Module):
                 attn_mask = attn_mask.expand_as(attn_weights)
 
             if attn_mask.dtype == torch.bool:
-                attn_weights = attn_weights.masked_fill(attn_mask, float('-inf'))
+                attn_weights = attn_weights.masked_fill(attn_mask, float("-inf"))
             else:
                 attn_weights = attn_weights + attn_mask
 
@@ -142,8 +149,7 @@ class MultiheadAttentionLoRA(nn.Module):
         if key_padding_mask is not None:
             # key_padding_mask: (batch, src_len), True = ignore
             attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2),
-                float('-inf')
+                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
             )
 
         # Softmax and dropout
@@ -154,7 +160,11 @@ class MultiheadAttentionLoRA(nn.Module):
         attn_output = torch.matmul(attn_weights, v)
 
         # Reshape back: (batch, num_heads, seq, head_dim) -> (batch, seq, embed_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, tgt_len, self.embed_dim)
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, tgt_len, self.embed_dim)
+        )
 
         # Output projection - LoRA is applied here
         attn_output = self.out_proj(attn_output)
@@ -314,15 +324,21 @@ class LoRAConfig:
         if target_modules is None:
             target_modules = [
                 # Standard attention projections
-                "q_proj", "k_proj", "v_proj", "out_proj",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "out_proj",
                 # Vision backbone (ViT-style)
                 "qkv",  # Fused Q/K/V projection
                 "proj",  # Output projection (note: will also match out_proj, c_proj)
-                "fc1", "fc2",  # MLP layers in vision backbone
+                "fc1",
+                "fc2",  # MLP layers in vision backbone
                 # Language backbone (CLIP-style) MLP
-                "c_fc", "c_proj",
+                "c_fc",
+                "c_proj",
                 # Transformer FFN layers
-                "linear1", "linear2",
+                "linear1",
+                "linear2",
             ]
         self.target_modules = set(target_modules)
 
@@ -372,15 +388,23 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
 
     def should_apply_lora_to_component(module_name: str) -> bool:
         """Check component-level flags to determine if we should apply LoRA."""
-        if ("vision_encoder" in module_name or "vision_backbone" in module_name) and not config.apply_to_vision_encoder:
+        if (
+            "vision_encoder" in module_name or "vision_backbone" in module_name
+        ) and not config.apply_to_vision_encoder:
             return False
-        if ("text_encoder" in module_name or "language_backbone" in module_name) and not config.apply_to_text_encoder:
+        if (
+            "text_encoder" in module_name or "language_backbone" in module_name
+        ) and not config.apply_to_text_encoder:
             return False
         if "geometry_encoder" in module_name and not config.apply_to_geometry_encoder:
             return False
-        if ("detr_encoder" in module_name or "transformer.encoder" in module_name) and not config.apply_to_detr_encoder:
+        if (
+            "detr_encoder" in module_name or "transformer.encoder" in module_name
+        ) and not config.apply_to_detr_encoder:
             return False
-        if ("detr_decoder" in module_name or "transformer.decoder" in module_name) and not config.apply_to_detr_decoder:
+        if (
+            "detr_decoder" in module_name or "transformer.decoder" in module_name
+        ) and not config.apply_to_detr_decoder:
             return False
         if "mask_decoder" in module_name and not config.apply_to_mask_decoder:
             return False
@@ -392,7 +416,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
             return False
 
         # Check if module name matches target modules
-        module_basename = module_name.split('.')[-1]
+        module_basename = module_name.split(".")[-1]
 
         # Direct basename match (e.g., "qkv", "proj", "linear1", etc.)
         if module_basename in config.target_modules:
@@ -419,7 +443,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
 
     for name, mha in mha_to_replace:
         # Get parent module and attribute name
-        *parent_path, attr_name = name.split('.')
+        *parent_path, attr_name = name.split(".")
         parent = model
         for p in parent_path:
             parent = getattr(parent, p)
@@ -444,14 +468,16 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
         setattr(parent, attr_name, new_mha)
         mha_replaced.append(name)
 
-    print(f"Replaced {len(mha_replaced)} nn.MultiheadAttention modules with MultiheadAttentionLoRA")
+    print(
+        f"Replaced {len(mha_replaced)} nn.MultiheadAttention modules with MultiheadAttentionLoRA"
+    )
 
     # STEP 2: Apply LoRA to all matching Linear layers
     # Now includes q_proj, k_proj, v_proj, out_proj from the replaced MHA modules
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and should_apply_lora(name):
             # Get parent module and attribute name
-            *parent_path, attr_name = name.split('.')
+            *parent_path, attr_name = name.split(".")
             parent = model
             for p in parent_path:
                 parent = getattr(parent, p)
@@ -505,7 +531,9 @@ def count_parameters(model: nn.Module) -> Dict[str, int]:
     return {
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
-        "trainable_percentage": 100 * trainable_params / total_params if total_params > 0 else 0,
+        "trainable_percentage": (
+            100 * trainable_params / total_params if total_params > 0 else 0
+        ),
     }
 
 

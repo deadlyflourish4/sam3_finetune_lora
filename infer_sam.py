@@ -41,7 +41,7 @@ from sam3.train.data.sam3_image_dataset import (
     Datapoint,
     Image as SAMImage,
     FindQueryLoaded,
-    InferenceMetadata
+    InferenceMetadata,
 )
 from sam3.train.data.collator import collate_fn_api
 from sam3.model.utils.misc import copy_data_to_device
@@ -54,7 +54,11 @@ from sam3.train.transforms.basic_for_api import (
 from sam3.eval.postprocessors import PostProcessImage
 
 # LoRA imports
-from sam3_finetune_lora.lora.lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights
+from sam3_finetune_lora.lora.lora_layers import (
+    LoRAConfig,
+    apply_lora_to_model,
+    load_lora_weights,
+)
 
 
 class SAM3LoRAInference:
@@ -67,7 +71,7 @@ class SAM3LoRAInference:
         resolution: int = 1008,
         detection_threshold: float = 0.5,
         nms_iou_threshold: float = 0.5,
-        device: str = "cuda"
+        device: str = "cuda",
     ):
         """
         Initialize SAM3 with LoRA.
@@ -81,13 +85,15 @@ class SAM3LoRAInference:
             device: Device to run on (default: "cuda")
         """
         # Load config
-        with open(config_path, 'r') as f:
+        with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
         # Auto-detect weights if not provided
         if weights_path is None:
-            output_dir = self.config.get('output', {}).get('output_dir', 'outputs/sam3_lora_full')
-            weights_path = os.path.join(output_dir, 'best_lora_weights.pt')
+            output_dir = self.config.get("output", {}).get(
+                "output_dir", "outputs/sam3_lora_full"
+            )
+            weights_path = os.path.join(output_dir, "best_lora_weights.pt")
             print(f"ℹ️  Auto-detected weights: {weights_path}")
 
         if not os.path.exists(weights_path):
@@ -112,7 +118,7 @@ class SAM3LoRAInference:
             compile=False,
             load_from_HF=True,
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=True
+            eval_mode=True,
         )
 
         # Apply LoRA configuration
@@ -146,7 +152,7 @@ class SAM3LoRAInference:
                     sizes=resolution,
                     max_size=resolution,
                     square=True,
-                    consistent_transform=False
+                    consistent_transform=False,
                 ),
                 ToTensorAPI(),
                 NormalizeAPI(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
@@ -160,7 +166,9 @@ class SAM3LoRAInference:
 
         print("✅ SAM3 + LoRA ready for inference!\n")
 
-    def create_datapoint(self, pil_image: PILImage.Image, text_prompts: List[str]) -> Datapoint:
+    def create_datapoint(
+        self, pil_image: PILImage.Image, text_prompts: List[str]
+    ) -> Datapoint:
         """
         Create a SAM3 datapoint from image and text prompts.
 
@@ -174,11 +182,7 @@ class SAM3LoRAInference:
         w, h = pil_image.size
 
         # Create SAM Image
-        sam_image = SAMImage(
-            data=pil_image,
-            objects=[],
-            size=[h, w]
-        )
+        sam_image = SAMImage(data=pil_image, objects=[], size=[h, w])
 
         # Create queries for each text prompt
         queries = []
@@ -196,21 +200,14 @@ class SAM3LoRAInference:
                     original_size=[w, h],
                     object_id=0,
                     frame_index=0,
-                )
+                ),
             )
             queries.append(query)
 
-        return Datapoint(
-            find_queries=queries,
-            images=[sam_image]
-        )
+        return Datapoint(find_queries=queries, images=[sam_image])
 
     @torch.no_grad()
-    def predict(
-        self,
-        image_path: str,
-        text_prompts: List[str]
-    ) -> dict:
+    def predict(self, image_path: str, text_prompts: List[str]) -> dict:
         """
         Run inference on an image with text prompts.
 
@@ -257,9 +254,13 @@ class SAM3LoRAInference:
 
             # Manual post-processing
             last_output = outputs[-1]
-            pred_logits = last_output['pred_logits']  # [batch, num_queries, num_classes]
-            pred_boxes = last_output['pred_boxes']    # [batch, num_queries, 4]
-            pred_masks = last_output.get('pred_masks', None)  # [batch, num_queries, H, W]
+            pred_logits = last_output[
+                "pred_logits"
+            ]  # [batch, num_queries, num_classes]
+            pred_boxes = last_output["pred_boxes"]  # [batch, num_queries, 4]
+            pred_masks = last_output.get(
+                "pred_masks", None
+            )  # [batch, num_queries, H, W]
 
             # Get probabilities
             out_probs = pred_logits.sigmoid()  # [batch, num_queries, num_classes]
@@ -295,41 +296,49 @@ class SAM3LoRAInference:
                 # Get masks and resize to original size
                 if pred_masks is not None:
                     # Apply NMS filtering to masks too
-                    masks_small = pred_masks[0, keep][keep_nms].sigmoid() > 0.5  # [num_keep_nms, H, W]
+                    masks_small = (
+                        pred_masks[0, keep][keep_nms].sigmoid() > 0.5
+                    )  # [num_keep_nms, H, W]
 
                     # Resize masks to original image size
                     import torch.nn.functional as F
-                    masks_resized = F.interpolate(
-                        masks_small.unsqueeze(0).float(),
-                        size=(orig_h, orig_w),
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(0) > 0.5
+
+                    masks_resized = (
+                        F.interpolate(
+                            masks_small.unsqueeze(0).float(),
+                            size=(orig_h, orig_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0)
+                        > 0.5
+                    )
 
                     masks_np = masks_resized.cpu().numpy()
                 else:
                     masks_np = None
 
                 results[query_idx] = {
-                    'prompt': prompt,
-                    'boxes': boxes_xyxy.cpu().numpy(),
-                    'scores': kept_scores.cpu().numpy(),
-                    'masks': masks_np,
-                    'num_detections': num_keep
+                    "prompt": prompt,
+                    "boxes": boxes_xyxy.cpu().numpy(),
+                    "scores": kept_scores.cpu().numpy(),
+                    "masks": masks_np,
+                    "num_detections": num_keep,
                 }
-                print(f"   '{prompt}': {num_keep} detections after NMS (max score: {kept_scores.max().item():.3f})")
+                print(
+                    f"   '{prompt}': {num_keep} detections after NMS (max score: {kept_scores.max().item():.3f})"
+                )
             else:
                 results[query_idx] = {
-                    'prompt': prompt,
-                    'boxes': None,
-                    'scores': None,
-                    'masks': None,
-                    'num_detections': 0
+                    "prompt": prompt,
+                    "boxes": None,
+                    "scores": None,
+                    "masks": None,
+                    "num_detections": 0,
                 }
                 print(f"   '{prompt}': 0 detections")
 
         # Store original image for visualization
-        results['_image'] = pil_image
+        results["_image"] = pil_image
 
         return results
 
@@ -339,7 +348,7 @@ class SAM3LoRAInference:
         output_path: str,
         show_boxes: bool = True,
         show_masks: bool = True,
-        show_labels: bool = True
+        show_labels: bool = True,
     ):
         """
         Visualize predictions on image.
@@ -350,43 +359,43 @@ class SAM3LoRAInference:
             show_boxes: Whether to show bounding boxes
             show_masks: Whether to show segmentation masks
         """
-        pil_image = results['_image']
+        pil_image = results["_image"]
 
         # Create figure
         fig, ax = plt.subplots(1, figsize=(12, 8))
         ax.imshow(pil_image)
 
         # Colors for different prompts
-        colors = ['red', 'blue', 'green', 'yellow', 'cyan', 'magenta']
+        colors = ["red", "blue", "green", "yellow", "cyan", "magenta"]
 
         total_detections = 0
 
         # Draw results for each prompt
-        for idx in sorted([k for k in results.keys() if k != '_image']):
+        for idx in sorted([k for k in results.keys() if k != "_image"]):
             result = results[idx]
-            prompt = result['prompt']
+            prompt = result["prompt"]
             color = colors[idx % len(colors)]
 
-            if result['num_detections'] == 0:
+            if result["num_detections"] == 0:
                 continue
 
-            total_detections += result['num_detections']
+            total_detections += result["num_detections"]
 
-            boxes = result['boxes']
-            scores = result['scores']
-            masks = result['masks']
+            boxes = result["boxes"]
+            scores = result["scores"]
+            masks = result["masks"]
 
-            for i in range(result['num_detections']):
+            for i in range(result["num_detections"]):
                 # Draw mask
                 if show_masks and masks is not None:
                     mask = masks[i]
                     colored_mask = np.zeros((*mask.shape, 4))
                     # Use different colors for different prompts
-                    if color == 'red':
+                    if color == "red":
                         colored_mask[mask] = [1, 0, 0, 0.4]
-                    elif color == 'blue':
+                    elif color == "blue":
                         colored_mask[mask] = [0, 0, 1, 0.4]
-                    elif color == 'green':
+                    elif color == "green":
                         colored_mask[mask] = [0, 1, 0, 0.4]
                     else:
                         colored_mask[mask] = [1, 1, 0, 0.4]
@@ -409,10 +418,12 @@ class SAM3LoRAInference:
 
                     # Draw rectangle
                     rect = patches.Rectangle(
-                        (x1, y1), width, height,
+                        (x1, y1),
+                        width,
+                        height,
                         linewidth=2,
                         edgecolor=color,
-                        facecolor='none'
+                        facecolor="none",
                     )
                     ax.add_patch(rect)
 
@@ -421,21 +432,27 @@ class SAM3LoRAInference:
                         score = scores[i] if scores is not None else 0
                         label = f"{prompt}: {score:.2f}"
                         ax.text(
-                            x1, y1 - 5,
+                            x1,
+                            y1 - 5,
                             label,
                             bbox=dict(facecolor=color, alpha=0.5),
                             fontsize=10,
-                            color='white'
+                            color="white",
                         )
 
-        ax.axis('off')
+        ax.axis("off")
 
         # Add title with all prompts
-        prompts_str = ", ".join([f'"{results[k]["prompt"]}"' for k in sorted([k for k in results.keys() if k != '_image'])])
-        plt.suptitle(f'Text Prompts: {prompts_str}', fontsize=12, y=0.98)
+        prompts_str = ", ".join(
+            [
+                f'"{results[k]["prompt"]}"'
+                for k in sorted([k for k in results.keys() if k != "_image"])
+            ]
+        )
+        plt.suptitle(f"Text Prompts: {prompts_str}", fontsize=12, y=0.98)
 
         plt.tight_layout()
-        plt.savefig(output_path, bbox_inches='tight', dpi=150)
+        plt.savefig(output_path, bbox_inches="tight", dpi=150)
         plt.close()
 
         print(f"\n✅ Saved visualization to {output_path}")
@@ -445,68 +462,45 @@ class SAM3LoRAInference:
 def main():
     parser = argparse.ArgumentParser(description="SAM3 + LoRA Inference")
     parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to training config YAML"
+        "--config", type=str, required=True, help="Path to training config YAML"
     )
     parser.add_argument(
         "--weights",
         type=str,
         default=None,
-        help="Path to LoRA weights (auto-detected if not provided)"
+        help="Path to LoRA weights (auto-detected if not provided)",
     )
-    parser.add_argument(
-        "--image",
-        type=str,
-        required=True,
-        help="Path to input image"
-    )
+    parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument(
         "--prompt",
         type=str,
-        nargs='+',
+        nargs="+",
         default=["object"],
-        help='Text prompt(s) to guide segmentation (e.g., "crack" or "crack" "defect")'
+        help='Text prompt(s) to guide segmentation (e.g., "crack" or "crack" "defect")',
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        default="output.png",
-        help="Output visualization path"
+        "--output", type=str, default="output.png", help="Output visualization path"
     )
     parser.add_argument(
-        "--threshold",
-        type=float,
-        default=0.5,
-        help="Detection confidence threshold"
+        "--threshold", type=float, default=0.5, help="Detection confidence threshold"
     )
     parser.add_argument(
-        "--resolution",
-        type=int,
-        default=1008,
-        help="Input resolution (default: 1008)"
+        "--resolution", type=int, default=1008, help="Input resolution (default: 1008)"
     )
     parser.add_argument(
-        "--no-boxes",
-        action="store_true",
-        help="Don't show bounding boxes"
+        "--no-boxes", action="store_true", help="Don't show bounding boxes"
     )
     parser.add_argument(
-        "--no-masks",
-        action="store_true",
-        help="Don't show segmentation masks"
+        "--no-masks", action="store_true", help="Don't show segmentation masks"
     )
     parser.add_argument(
-        "--no-labels",
-        action="store_true",
-        help="Don't show labels on bounding boxes"
+        "--no-labels", action="store_true", help="Don't show labels on bounding boxes"
     )
     parser.add_argument(
         "--nms-iou",
         type=float,
         default=0.5,
-        help="NMS IoU threshold (default: 0.5, lower = fewer overlapping boxes)"
+        help="NMS IoU threshold (default: 0.5, lower = fewer overlapping boxes)",
     )
 
     args = parser.parse_args()
@@ -517,7 +511,7 @@ def main():
         weights_path=args.weights,
         resolution=args.resolution,
         detection_threshold=args.threshold,
-        nms_iou_threshold=args.nms_iou
+        nms_iou_threshold=args.nms_iou,
     )
 
     # Run inference
@@ -529,18 +523,18 @@ def main():
         args.output,
         show_boxes=not args.no_boxes,
         show_masks=not args.no_masks,
-        show_labels=not args.no_labels
+        show_labels=not args.no_labels,
     )
 
     # Print summary
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("📊 Summary:")
-    for idx in sorted([k for k in results.keys() if k != '_image']):
+    for idx in sorted([k for k in results.keys() if k != "_image"]):
         result = results[idx]
         print(f"   Prompt '{result['prompt']}': {result['num_detections']} detections")
-        if result['num_detections'] > 0 and result['scores'] is not None:
+        if result["num_detections"] > 0 and result["scores"] is not None:
             print(f"      Max confidence: {result['scores'].max():.3f}")
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":

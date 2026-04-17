@@ -7,7 +7,6 @@ import torch
 
 from sam3.perflib.masks_ops import mask_iou
 
-
 try:
     from torch_generic_nms import generic_nms as generic_nms_cuda
 

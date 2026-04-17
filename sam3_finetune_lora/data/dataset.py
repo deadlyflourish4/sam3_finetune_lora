@@ -3,14 +3,22 @@ import torch
 from pathlib import Path
 from PIL import Image as PILImage
 
-from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
+from sam3.train.data.sam3_image_dataset import (
+    Datapoint,
+    Image,
+    Object,
+    FindQueryLoaded,
+    InferenceMetadata,
+)
 
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
 
+
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
+
     def __init__(self, img_dir, ann_file, split="train"):
         """
         Args:
@@ -26,34 +34,38 @@ class COCOSegmentDataset(Dataset):
         if not self.ann_file.exists():
             raise FileNotFoundError(f"COCO annotation file not found: {self.ann_file}")
 
-        with open(self.ann_file, 'r') as f:
+        with open(self.ann_file, "r") as f:
             self.coco_data = json.load(f)
 
         # Build index: image_id -> image info
-        self.images = {img['id']: img for img in self.coco_data['images']}
+        self.images = {img["id"]: img for img in self.coco_data["images"]}
         self.image_ids = sorted(list(self.images.keys()))
 
         # Build index: image_id -> list of annotations
         self.img_to_anns = {}
-        for ann in self.coco_data['annotations']:
-            img_id = ann['image_id']
+        for ann in self.coco_data["annotations"]:
+            img_id = ann["image_id"]
             if img_id not in self.img_to_anns:
                 self.img_to_anns[img_id] = []
             self.img_to_anns[img_id].append(ann)
 
         # Load categories
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
+        self.categories = {
+            cat["id"]: cat["name"] for cat in self.coco_data["categories"]
+        }
         print(f"Loaded COCO dataset: {split} split")
         print(f"  Images: {len(self.image_ids)}")
         print(f"  Annotations: {len(self.coco_data['annotations'])}")
         print(f"  Categories: {self.categories}")
 
         self.resolution = 1008
-        self.transform = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        self.transform = v2.Compose(
+            [
+                v2.ToImage(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
 
     def __len__(self):
         return len(self.image_ids)
@@ -63,12 +75,14 @@ class COCOSegmentDataset(Dataset):
         img_info = self.images[img_id]
 
         # Load image
-        img_path = self.img_dir / img_info['file_name']
+        img_path = self.img_dir / img_info["file_name"]
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
         # Resize image
-        pil_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
+        pil_image = pil_image.resize(
+            (self.resolution, self.resolution), PILImage.BILINEAR
+        )
 
         # Transform to tensor
         image_tensor = self.transform(pil_image)
@@ -101,18 +115,21 @@ class COCOSegmentDataset(Dataset):
             cy = y + h / 2.0
 
             # Scale to resolution and normalize to [0, 1]
-            box_tensor = torch.tensor([
-                cx * scale_w / self.resolution,
-                cy * scale_h / self.resolution,
-                w * scale_w / self.resolution,
-                h * scale_h / self.resolution,
-            ], dtype=torch.float32)
+            box_tensor = torch.tensor(
+                [
+                    cx * scale_w / self.resolution,
+                    cy * scale_h / self.resolution,
+                    w * scale_w / self.resolution,
+                    h * scale_h / self.resolution,
+                ],
+                dtype=torch.float32,
+            )
 
             # Handle segmentation mask (polygon or RLE format)
             segment = None
             segmentation = ann.get("segmentation", None)
-            if isinstance(segmentation, list) and len(segmentation) == 0:
-                print("*************************************")
+            # if isinstance(segmentation, list) and len(segmentation) == 0:
+            #     print("*************************************")
             if segmentation:
                 try:
                     # Check if it's RLE format (dict) or polygon format (list)
@@ -126,35 +143,35 @@ class COCOSegmentDataset(Dataset):
                         rle = mask_utils.merge(rles)
                         mask_np = mask_utils.decode(rle)
                     else:
-                        print(f"Warning: Unknown segmentation format: {type(segmentation)}")
+                        print(
+                            f"Warning: Unknown segmentation format: {type(segmentation)}"
+                        )
                         segment = None
                         continue
 
                     # Resize mask to model resolution
                     mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
                     mask_t = torch.nn.functional.interpolate(
-                        mask_t,
-                        size=(self.resolution, self.resolution),
-                        mode="nearest"
+                        mask_t, size=(self.resolution, self.resolution), mode="nearest"
                     )
                     segment = mask_t.squeeze() > 0.5  # [1008, 1008] boolean tensor
 
                 except Exception as e:
-                    print(f"Warning: Error processing mask for image {img_id}, ann {i}: {e}")
+                    print(
+                        f"Warning: Error processing mask for image {img_id}, ann {i}: {e}"
+                    )
                     segment = None
 
             obj = Object(
                 bbox=box_tensor,
                 area=(box_tensor[2] * box_tensor[3]).item(),
                 object_id=i,
-                segment=segment
+                segment=segment,
             )
             objects.append(obj)
 
         image_obj = Image(
-            data=image_tensor,
-            objects=objects,
-            size=(self.resolution, self.resolution)
+            data=image_tensor, objects=objects, size=(self.resolution, self.resolution)
         )
 
         # Construct Queries - one per unique category
@@ -162,28 +179,35 @@ class COCOSegmentDataset(Dataset):
         from collections import defaultdict
 
         # Group object IDs by their class name
-        class_to_object_ids = defaultdict(list)
-        for obj, class_name in zip(objects, object_class_names):
-            class_to_object_ids[class_name.lower()].append(obj.object_id)
+        class_to_query = {}
+        for obj, class_name, ann in zip(objects, object_class_names, annotations):
+            category_id = ann.get("category_id", 0)
+            query_key = class_name.lower()
+            if query_key not in class_to_query:
+                class_to_query[query_key] = {
+                    "object_ids": [],
+                    "category_id": category_id,
+                }
+            class_to_query[query_key]["object_ids"].append(obj.object_id)
 
         # Create one query per category
         queries = []
-        if len(class_to_object_ids) > 0:
-            for query_text, obj_ids in class_to_object_ids.items():
+        if len(class_to_query) > 0:
+            for query_text, query_info in class_to_query.items():
                 query = FindQueryLoaded(
                     query_text=query_text,
                     image_id=0,
-                    object_ids_output=obj_ids,
+                    object_ids_output=query_info["object_ids"],
                     is_exhaustive=True,
                     query_processing_order=0,
                     inference_metadata=InferenceMetadata(
                         coco_image_id=img_id,
                         original_image_id=img_id,
-                        original_category_id=0,
+                        original_category_id=query_info["category_id"],
                         original_size=(orig_h, orig_w),
                         object_id=-1,
-                        frame_index=-1
-                    )
+                        frame_index=-1,
+                    ),
                 )
                 queries.append(query)
         else:
@@ -200,14 +224,11 @@ class COCOSegmentDataset(Dataset):
                     original_category_id=0,
                     original_size=(orig_h, orig_w),
                     object_id=-1,
-                    frame_index=-1
-                )
+                    frame_index=-1,
+                ),
             )
             queries.append(query)
 
         return Datapoint(
-            find_queries=queries,
-            images=[image_obj],
-            raw_images=[pil_image]
+            find_queries=queries, images=[image_obj], raw_images=[pil_image]
         )
-

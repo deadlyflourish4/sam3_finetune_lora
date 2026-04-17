@@ -149,13 +149,11 @@ def with_check_parameter_frozen(
     summary_after = _get_state_dict_summary(frozen_state_dict)
 
     if not np.allclose(summary_before, summary_after, atol=1e-6):
-        raise ValueError(
-            f"""
+        raise ValueError(f"""
             The `model_weight_initializer` has initialized parameters frozen with `skip_saving_parameters`.
             You can resolve this error by either initializing those parameters from within the model definition
             or using the flag `trainer.checkpoint.initialize_after_preemption` to True.
-        """
-        )
+        """)
 
 
 class CkptExcludeKernel:

@@ -1,10 +1,11 @@
 import yaml
-import torch 
+import torch
 import json
 from collections import defaultdict
 import os
 from tqdm import tqdm
 from pathlib import Path
+import time
 
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -19,7 +20,13 @@ from sam3.train.loss.loss_fns import IABCEMdetr, Boxes, Masks, CORE_LOSS_KEY
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
-from sam3_finetune_lora.lora.lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
+from sam3.eval.postprocessors import PostProcessImage
+from sam3_finetune_lora.lora.lora_layers import (
+    LoRAConfig,
+    apply_lora_to_model,
+    save_lora_weights,
+    count_parameters,
+)
 
 from sam3_finetune_lora.utils.utils import (
     setup_distributed,
@@ -32,6 +39,8 @@ from sam3_finetune_lora.utils.utils import (
 )
 
 from sam3_finetune_lora.data.dataset import COCOSegmentDataset
+from sam3_finetune_lora.utils.metrics import DetectionMetricsEvaluator
+from sam3_finetune_lora.utils.plotting import plot_results
 
 class SAM3TrainerNative:
     def __init__(self, config_path, multi_gpu=False):
@@ -58,8 +67,7 @@ class SAM3TrainerNative:
         load_from_hf = checkpoint_path is None
         training_cfg = self.config.get("training", {})
         self.enable_segmentation = self.config["model"].get(
-            "enable_segmentation",
-            training_cfg.get("enable_segmentation", True)
+            "enable_segmentation", training_cfg.get("enable_segmentation", True)
         )
         self.detection_only = training_cfg.get("detection_only", False)
         self.box_weights = {
@@ -78,8 +86,7 @@ class SAM3TrainerNative:
             self.mask_weights["loss_mask"] = 0.0
             self.mask_weights["loss_dice"] = 0.0
         self.mask_loss_enabled = any(
-            self.mask_weights.get(key, 0.0) != 0.0
-            for key in ("loss_mask", "loss_dice")
+            self.mask_weights.get(key, 0.0) != 0.0 for key in ("loss_mask", "loss_dice")
         )
         self.loss_weights = {
             **self.cls_weights,
@@ -94,7 +101,7 @@ class SAM3TrainerNative:
             checkpoint_path=checkpoint_path,
             enable_segmentation=self.enable_segmentation,
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=False
+            eval_mode=False,
         )
 
         # Apply LoRA
@@ -115,7 +122,9 @@ class SAM3TrainerNative:
         self.model = apply_lora_to_model(self.model, lora_config)
 
         stats = count_parameters(self.model)
-        print_rank0(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
+        print_rank0(
+            f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)"
+        )
 
         self.model.to(self.device)
 
@@ -125,7 +134,7 @@ class SAM3TrainerNative:
                 self.model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                find_unused_parameters=False  # Frozen params (requires_grad=False) don't need this flag
+                find_unused_parameters=False,  # Frozen params (requires_grad=False) don't need this flag
             )
             print_rank0(f"Model wrapped with DistributedDataParallel")
 
@@ -136,9 +145,9 @@ class SAM3TrainerNative:
         self.optimizer = AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=float(self.config["training"]["learning_rate"]),
-            weight_decay=self.config["training"]["weight_decay"]
+            weight_decay=self.config["training"]["weight_decay"],
         )
-        
+
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(
             cost_class=2.0, cost_bbox=5.0, cost_giou=2.0, focal=True
@@ -161,16 +170,12 @@ class SAM3TrainerNative:
                 weight_dict=self.mask_weights,
                 focal_alpha=0.25,
                 focal_gamma=2.0,
-                compute_aux=False
-            )
+                compute_aux=False,
+            ),
         ]
 
         # Create one-to-many matcher for auxiliary outputs
-        o2m_matcher = BinaryOneToManyMatcher(
-            alpha=0.3,
-            threshold=0.4,
-            topk=4
-        )
+        o2m_matcher = BinaryOneToManyMatcher(alpha=0.3, threshold=0.4, topk=4)
 
         # Use Sam3LossWrapper for proper loss computation
         self.loss_wrapper = Sam3LossWrapper(
@@ -194,6 +199,25 @@ class SAM3TrainerNative:
             f"mask_loss_enabled={self.mask_loss_enabled}"
         )
         print_rank0(f"Loss weights: {self.loss_weights}")
+
+        # Metrics/plot state (used by save_metrics() and plot_metrics()).
+        self.save_dir = Path(self.config["output"]["output_dir"])
+        self.csv = self.save_dir / "results.csv"
+        self.plots = {}
+        self.epoch = 0
+        self.train_time_start = time.time()
+        eval_cfg = self.config.get("evaluation", {})
+        self.metric_conf_threshold = float(eval_cfg.get("conf_threshold", 0.25))
+        self.metric_max_dets = int(eval_cfg.get("max_dets_per_img", 100))
+        self.box_postprocessor = PostProcessImage(
+            max_dets_per_img=self.metric_max_dets,
+            iou_type="bbox",
+            to_cpu=True,
+            use_original_ids=True,
+            use_original_sizes_box=True,
+            use_presence=True,
+            detection_threshold=self.metric_conf_threshold,
+        )
 
     @staticmethod
     def _extract_scalar_losses(loss_dict):
@@ -241,14 +265,84 @@ class SAM3TrainerNative:
             if key not in ordered_keys:
                 shown.append(f"{key}={losses[key]:.6f}")
         return ", ".join(shown)
-        
+
+    @staticmethod
+    def _coco_bbox_to_xyxy(bbox):
+        x, y, w, h = bbox
+        return [x, y, x + w, y + h]
+
+    @classmethod
+    def _build_targets_by_image(cls, dataset):
+        targets_by_image = {}
+        for image_id, annotations in dataset.img_to_anns.items():
+            boxes = []
+            labels = []
+            for ann in annotations:
+                bbox = ann.get("bbox")
+                if bbox is None:
+                    continue
+                boxes.append(cls._coco_bbox_to_xyxy(bbox))
+                labels.append(int(ann.get("category_id", 0)))
+            targets_by_image[image_id] = {
+                "boxes": torch.tensor(boxes, dtype=torch.float32)
+                if boxes
+                else torch.zeros((0, 4), dtype=torch.float32),
+                "labels": torch.tensor(labels, dtype=torch.int64)
+                if labels
+                else torch.zeros((0,), dtype=torch.int64),
+            }
+        return targets_by_image
+
+    def _update_detection_metrics(self, evaluator, outputs_list, find_metadatas, targets_by_image):
+        predictions = self.box_postprocessor.process_results(outputs_list, find_metadatas)
+        for image_id, prediction in predictions.items():
+            target = targets_by_image.get(
+                image_id,
+                {
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                    "labels": torch.zeros((0,), dtype=torch.int64),
+                },
+            )
+            evaluator.update(
+                pred_boxes=prediction["boxes"],
+                pred_scores=prediction["scores"],
+                pred_labels=prediction["labels"].to(dtype=torch.int64),
+                target_boxes=target["boxes"],
+                target_labels=target["labels"],
+            )
+
+    def save_metrics(self, metrics):
+        """Save training metrics to a CSV file."""
+        keys, vals = list(metrics.keys()), list(metrics.values())
+        n = len(metrics) + 2  # number of cols
+        t = time.time() - self.train_time_start
+        self.csv.parent.mkdir(
+            parents=True, exist_ok=True
+        )  # ensure parent directory exists
+        s = (
+            ""
+            if self.csv.exists()
+            else ("%s," * n % ("epoch", "time", *keys)).rstrip(",") + "\n"
+        )
+        with open(self.csv, "a", encoding="utf-8") as f:
+            f.write(s + ("%.6g," * n % (self.epoch + 1, t, *vals)).rstrip(",") + "\n")
+
+    def plot_metrics(self):
+        """Plot metrics from a CSV file."""
+        plot_results(file=self.csv, on_plot=self.on_plot)  # save results.png
+
+    def on_plot(self, name, data=None):
+        """Register generated plot paths with timestamp metadata."""
+        path = Path(name)
+        self.plots[path] = {"data": data, "timestamp": time.time()}
+
     def train(self):
         # Extract explicit paths if provided, or fallback to data_dir
         train_img_dir = self.config["training"].get("img_folder_train")
         train_ann_file = self.config["training"].get("ann_file_train")
         val_img_dir = self.config["training"].get("img_folder_val")
         val_ann_file = self.config["training"].get("ann_file_val")
-        
+
         # If explicit paths aren't given, build backward-compatible paths
         if not train_img_dir:
             data_dir = self.config["training"].get("data_dir", "/workspace/data")
@@ -260,7 +354,10 @@ class SAM3TrainerNative:
         # Load datasets using COCO format
         print_rank0(f"\nLoading training data from {train_img_dir}...")
         print_rank0(f"Annotation file: {train_ann_file}")
-        train_ds = COCOSegmentDataset(img_dir=train_img_dir, ann_file=train_ann_file, split="train")
+        train_ds = COCOSegmentDataset(
+            img_dir=train_img_dir, ann_file=train_ann_file, split="train"
+        )
+        val_targets_by_image = {}
 
         # Check if validation data exists
         has_validation = False
@@ -269,9 +366,12 @@ class SAM3TrainerNative:
         try:
             print_rank0(f"\nLoading validation data from {val_img_dir}...")
             print_rank0(f"Annotation file: {val_ann_file}")
-            val_ds = COCOSegmentDataset(img_dir=val_img_dir, ann_file=val_ann_file, split="valid")
+            val_ds = COCOSegmentDataset(
+                img_dir=val_img_dir, ann_file=val_ann_file, split="valid"
+            )
             if len(val_ds) > 0:
                 has_validation = True
+                val_targets_by_image = self._build_targets_by_image(val_ds)
                 print_rank0(f"Found validation data: {len(val_ds)} images")
             else:
                 print_rank0(f"Validation dataset is empty.")
@@ -292,17 +392,11 @@ class SAM3TrainerNative:
 
         if self.multi_gpu:
             train_sampler = DistributedSampler(
-                train_ds,
-                num_replicas=self.world_size,
-                rank=get_rank(),
-                shuffle=True
+                train_ds, num_replicas=self.world_size, rank=get_rank(), shuffle=True
             )
             if has_validation:
                 val_sampler = DistributedSampler(
-                    val_ds,
-                    num_replicas=self.world_size,
-                    rank=get_rank(),
-                    shuffle=False
+                    val_ds, num_replicas=self.world_size, rank=get_rank(), shuffle=False
                 )
 
         train_loader = DataLoader(
@@ -312,7 +406,7 @@ class SAM3TrainerNative:
             sampler=train_sampler,
             collate_fn=collate_fn,
             num_workers=self.config["training"].get("num_workers", 0),
-            pin_memory=True
+            pin_memory=True,
         )
 
         if has_validation:
@@ -323,34 +417,29 @@ class SAM3TrainerNative:
                 sampler=val_sampler,
                 collate_fn=collate_fn,
                 num_workers=self.config["training"].get("num_workers", 0),
-                pin_memory=True
+                pin_memory=True,
             )
         else:
             val_loader = None
 
         self.model.train()
 
-        # Weights from a standard SAM config roughly
-        weight_dict = {
-            "loss_ce": 2.0,
-            "loss_bbox": 5.0,
-            "loss_giou": 2.0,
-            "loss_mask": 5.0,
-            "loss_dice": 5.0
-        }
-
         epochs = self.config["training"]["num_epochs"]
-        best_val_loss = float('inf')
+        best_val_loss = float("inf")
         print_rank0(f"Starting training for {epochs} epochs...")
 
         if has_validation:
-            print_rank0(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
+            print_rank0(
+                f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}"
+            )
         else:
             print_rank0(f"Training samples: {len(train_ds)}")
             print_rank0("⚠️  No validation data found - training without validation")
 
         if self.multi_gpu:
-            print_rank0(f"Effective batch size: {self.config['training']['batch_size']} x {self.world_size} = {self.config['training']['batch_size'] * self.world_size}")
+            print_rank0(
+                f"Effective batch size: {self.config['training']['batch_size']} x {self.world_size} = {self.config['training']['batch_size'] * self.world_size}"
+            )
 
         # Helper to move BatchedDatapoint to device
         def move_to_device(obj, device):
@@ -372,8 +461,14 @@ class SAM3TrainerNative:
         # Create output directory
         out_dir = Path(self.config["output"]["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dir = out_dir
+        self.csv = self.save_dir / "results.csv"
+        self.train_time_start = time.time()
+        if self.csv.exists():
+            self.csv.unlink()
 
         for epoch in range(epochs):
+            self.epoch = epoch
             # Set epoch for distributed sampler (required for proper shuffling)
             if self.multi_gpu and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -383,7 +478,9 @@ class SAM3TrainerNative:
             train_loss_meter = defaultdict(list)
 
             # Only show progress bar on rank 0
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
+            pbar = tqdm(
+                train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process()
+            )
             for batch_dict in pbar:
                 input_batch = batch_dict["input"]
 
@@ -396,7 +493,10 @@ class SAM3TrainerNative:
 
                 # Prepare targets for loss
                 # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
-                find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                find_targets = [
+                    self._unwrapped_model.back_convert(target)
+                    for target in input_batch.find_targets
+                ]
 
                 # Move targets to device
                 for targets in find_targets:
@@ -424,7 +524,7 @@ class SAM3TrainerNative:
                 # Compute loss using Sam3LossWrapper
                 # This handles num_boxes calculation and proper weighting
                 loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                
+
                 # Extract total loss
                 total_loss = loss_dict[CORE_LOSS_KEY]
 
@@ -444,7 +544,9 @@ class SAM3TrainerNative:
                 pbar.set_postfix(postfix)
 
             # Calculate average training loss for this epoch
-            avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
+            avg_train_loss = (
+                sum(train_losses) / len(train_losses) if train_losses else 0.0
+            )
             avg_train_components = self._average_loss_meter(train_loss_meter)
 
             # Validation (only compute loss - no metrics, like SAM3)
@@ -452,9 +554,12 @@ class SAM3TrainerNative:
                 self.model.eval()
                 val_losses = []
                 val_loss_meter = defaultdict(list)
+                det_metrics_evaluator = DetectionMetricsEvaluator()
 
                 with torch.no_grad():
-                    val_pbar = tqdm(val_loader, desc=f"Validation", disable=not is_main_process())
+                    val_pbar = tqdm(
+                        val_loader, desc=f"Validation", disable=not is_main_process()
+                    )
 
                     for batch_dict in val_pbar:
                         input_batch = batch_dict["input"]
@@ -464,7 +569,10 @@ class SAM3TrainerNative:
                         outputs_list = self.model(input_batch)
 
                         # Prepare targets
-                        find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                        find_targets = [
+                            self._unwrapped_model.back_convert(target)
+                            for target in input_batch.find_targets
+                        ]
 
                         # Move targets to device
                         for targets in find_targets:
@@ -474,15 +582,24 @@ class SAM3TrainerNative:
 
                         # Add matcher indices to outputs (required by Sam3LossWrapper)
                         with SAM3Output.iteration_mode(
-                            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                            outputs_list,
+                            iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE,
                         ) as outputs_iter:
-                            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                                stage_targets_list = [stage_targets] * len(stage_outputs)
-                                for outputs, targets in zip(stage_outputs, stage_targets_list):
+                            for stage_outputs, stage_targets in zip(
+                                outputs_iter, find_targets
+                            ):
+                                stage_targets_list = [stage_targets] * len(
+                                    stage_outputs
+                                )
+                                for outputs, targets in zip(
+                                    stage_outputs, stage_targets_list
+                                ):
                                     outputs["indices"] = self.matcher(outputs, targets)
                                     if "aux_outputs" in outputs:
                                         for aux_out in outputs["aux_outputs"]:
-                                            aux_out["indices"] = self.matcher(aux_out, targets)
+                                            aux_out["indices"] = self.matcher(
+                                                aux_out, targets
+                                            )
 
                         # Compute loss using Sam3LossWrapper
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
@@ -490,6 +607,12 @@ class SAM3TrainerNative:
 
                         val_losses.append(total_loss.item())
                         self._update_loss_meter(val_loss_meter, loss_dict)
+                        self._update_detection_metrics(
+                            det_metrics_evaluator,
+                            outputs_list,
+                            input_batch.find_metadatas,
+                            val_targets_by_image,
+                        )
                         postfix = {"val_loss": f"{total_loss.item():.4f}"}
                         if "loss_mask" in loss_dict:
                             postfix["val_mask"] = f"{loss_dict['loss_mask'].item():.4f}"
@@ -499,36 +622,82 @@ class SAM3TrainerNative:
 
                 avg_val_loss = sum(val_losses) / len(val_losses)
                 avg_val_components = self._average_loss_meter(val_loss_meter)
+                val_detection_metrics = det_metrics_evaluator.compute()
 
                 # Synchronize val_loss across all processes for consistent best model selection
                 if self.multi_gpu:
                     val_loss_tensor = torch.tensor([avg_val_loss], device=self.device)
                     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
                     avg_val_loss = val_loss_tensor.item()
+                    gathered_stats = [None for _ in range(self.world_size)] if is_main_process() else None
+                    dist.gather_object(
+                        det_metrics_evaluator.state_dict(), gathered_stats, dst=0
+                    )
+                    if is_main_process():
+                        merged_evaluator = DetectionMetricsEvaluator()
+                        merged_evaluator.merge(gathered_stats)
+                        val_detection_metrics = merged_evaluator.compute()
 
                 print_rank0(f"\nEpoch {epoch+1}/{epochs}")
-                print_rank0(f"  Train: {self._format_loss_summary(avg_train_components)}")
+                print_rank0(
+                    f"  Train: {self._format_loss_summary(avg_train_components)}"
+                )
                 print_rank0(f"  Val:   {self._format_loss_summary(avg_val_components)}")
+                print_rank0(
+                    "  Metrics: "
+                    f"P={val_detection_metrics.precision:.4f}, "
+                    f"R={val_detection_metrics.recall:.4f}, "
+                    f"mAP50={val_detection_metrics.map50:.4f}, "
+                    f"mAP50-95={val_detection_metrics.map5095:.4f}"
+                )
+
+                stats_metrics = {"train/loss": avg_train_loss, "val/loss": avg_val_loss}
+                stats_metrics.update(
+                    {f"train/{k}": v for k, v in avg_train_components.items()}
+                )
+                stats_metrics.update(
+                    {f"val/{k}": v for k, v in avg_val_components.items()}
+                )
+                stats_metrics.update(val_detection_metrics.to_dict())
 
                 # Save models based on validation loss (only on rank 0)
                 if is_main_process():
+                    self.save_metrics(stats_metrics)
+                    self.plot_metrics()
+
                     # Get underlying model from DDP wrapper
                     model_to_save = self.model.module if self.multi_gpu else self.model
-                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+                    save_lora_weights(
+                        model_to_save, str(out_dir / "last_lora_weights.pt")
+                    )
 
                     if avg_val_loss < best_val_loss:
                         best_val_loss = avg_val_loss
-                        save_lora_weights(model_to_save, str(out_dir / "best_lora_weights.pt"))
+                        save_lora_weights(
+                            model_to_save, str(out_dir / "best_lora_weights.pt")
+                        )
                         print(f"✓ New best model saved (val_loss: {avg_val_loss:.6f})")
 
                     # Log to file
                     stats_row = {
                         "epoch": epoch + 1,
                         "train_loss": avg_train_loss,
-                        "val_loss": avg_val_loss
+                        "val_loss": avg_val_loss,
                     }
-                    stats_row.update({f"train_{k}": v for k, v in avg_train_components.items()})
-                    stats_row.update({f"val_{k}": v for k, v in avg_val_components.items()})
+                    stats_row.update(
+                        {f"train_{k}": v for k, v in avg_train_components.items()}
+                    )
+                    stats_row.update(
+                        {f"val_{k}": v for k, v in avg_val_components.items()}
+                    )
+                    stats_row.update(
+                        {
+                            "precision": val_detection_metrics.precision,
+                            "recall": val_detection_metrics.recall,
+                            "mAP50": val_detection_metrics.map50,
+                            "mAP50-95": val_detection_metrics.map5095,
+                        }
+                    )
                     with open(out_dir / "val_stats.json", "a") as f:
                         f.write(json.dumps(stats_row) + "\n")
 
@@ -538,12 +707,23 @@ class SAM3TrainerNative:
                 self.model.train()
             else:
                 print_rank0(f"\nEpoch {epoch+1}/{epochs}")
-                print_rank0(f"  Train: {self._format_loss_summary(avg_train_components)}")
+                print_rank0(
+                    f"  Train: {self._format_loss_summary(avg_train_components)}"
+                )
 
                 # No validation - just save model each epoch (only on rank 0)
                 if is_main_process():
+                    stats_metrics = {"train/loss": avg_train_loss}
+                    stats_metrics.update(
+                        {f"train/{k}": v for k, v in avg_train_components.items()}
+                    )
+                    self.save_metrics(stats_metrics)
+                    self.plot_metrics()
+
                     model_to_save = self.model.module if self.multi_gpu else self.model
-                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+                    save_lora_weights(
+                        model_to_save, str(out_dir / "last_lora_weights.pt")
+                    )
 
         # Synchronize before final save
         if self.multi_gpu:
@@ -568,6 +748,7 @@ class SAM3TrainerNative:
             else:
                 # If no validation, copy last to best
                 import shutil
+
                 last_path = out_dir / "last_lora_weights.pt"
                 best_path = out_dir / "best_lora_weights.pt"
                 if last_path.exists():
@@ -579,7 +760,9 @@ class SAM3TrainerNative:
                 print(f"\nModels saved to {out_dir}:")
                 print(f"  - best_lora_weights.pt (copy of last epoch)")
                 print(f"  - last_lora_weights.pt (last epoch)")
-                print(f"\nℹ️  No validation data - consider adding data/valid/ for better model selection")
+                print(
+                    f"\nℹ️  No validation data - consider adding data/valid/ for better model selection"
+                )
                 print(f"{'='*80}")
 
         # Cleanup distributed training

@@ -14,7 +14,6 @@ from sam3.model.data_misc import (
 
 from .sam3_image_dataset import Datapoint
 
-
 MyTensor = Union[torch.Tensor, List[Any]]
 
 

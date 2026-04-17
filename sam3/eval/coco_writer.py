@@ -29,7 +29,6 @@ from sam3.train.utils.distributed import (
     is_main_process,
 )
 
-
 ### Helper functions and classes
 
 
