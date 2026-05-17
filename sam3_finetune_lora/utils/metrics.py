@@ -130,12 +130,12 @@ class DetectionMetrics:
     map50: float = 0.0
     map5095: float = 0.0
 
-    def to_dict(self) -> dict[str, float]:
+    def to_dict(self, prefix: str = "metrics") -> dict[str, float]:
         return {
-            "metrics/precision(B)": self.precision,
-            "metrics/recall(B)": self.recall,
-            "metrics/mAP50(B)": self.map50,
-            "metrics/mAP50-95(B)": self.map5095,
+            f"{prefix}/precision(B)": self.precision,
+            f"{prefix}/recall(B)": self.recall,
+            f"{prefix}/mAP50(B)": self.map50,
+            f"{prefix}/mAP50-95(B)": self.map5095,
         }
 
 

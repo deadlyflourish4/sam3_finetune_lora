@@ -221,9 +221,18 @@ class SAM3TrainerNative:
 
     @staticmethod
     def _extract_scalar_losses(loss_dict):
+        _MAIN_KEYS = {
+            CORE_LOSS_KEY,
+            "loss_ce",
+            "presence_loss",
+            "loss_bbox",
+            "loss_giou",
+            "loss_mask",
+            "loss_dice",
+        }
         scalar_losses = {}
         for key, value in loss_dict.items():
-            if key != CORE_LOSS_KEY and "loss" not in key:
+            if key not in _MAIN_KEYS:
                 continue
             if isinstance(value, torch.Tensor):
                 if value.numel() != 1:
@@ -357,6 +366,7 @@ class SAM3TrainerNative:
         train_ds = COCOSegmentDataset(
             img_dir=train_img_dir, ann_file=train_ann_file, split="train"
         )
+        train_targets_by_image = self._build_targets_by_image(train_ds)
         val_targets_by_image = {}
 
         # Check if validation data exists
@@ -476,6 +486,7 @@ class SAM3TrainerNative:
             # Track training losses for this epoch
             train_losses = []
             train_loss_meter = defaultdict(list)
+            train_det_evaluator = DetectionMetricsEvaluator()
 
             # Only show progress bar on rank 0
             pbar = tqdm(
@@ -536,6 +547,10 @@ class SAM3TrainerNative:
                 # Track training loss
                 train_losses.append(total_loss.item())
                 self._update_loss_meter(train_loss_meter, loss_dict)
+                self._update_detection_metrics(
+                    train_det_evaluator, outputs_list,
+                    input_batch.find_metadatas, train_targets_by_image,
+                )
                 postfix = {"loss": f"{total_loss.item():.4f}"}
                 if "loss_mask" in loss_dict:
                     postfix["mask"] = f"{loss_dict['loss_mask'].item():.4f}"
@@ -548,6 +563,18 @@ class SAM3TrainerNative:
                 sum(train_losses) / len(train_losses) if train_losses else 0.0
             )
             avg_train_components = self._average_loss_meter(train_loss_meter)
+            train_detection_metrics = train_det_evaluator.compute()
+
+            # Synchronize train metrics across GPUs
+            if self.multi_gpu:
+                gathered_train_stats = [None for _ in range(self.world_size)] if is_main_process() else None
+                dist.gather_object(
+                    train_det_evaluator.state_dict(), gathered_train_stats, dst=0
+                )
+                if is_main_process():
+                    merged_train_eval = DetectionMetricsEvaluator()
+                    merged_train_eval.merge(gathered_train_stats)
+                    train_detection_metrics = merged_train_eval.compute()
 
             # Validation (only compute loss - no metrics, like SAM3)
             if has_validation and val_loader is not None:
@@ -644,7 +671,14 @@ class SAM3TrainerNative:
                 )
                 print_rank0(f"  Val:   {self._format_loss_summary(avg_val_components)}")
                 print_rank0(
-                    "  Metrics: "
+                    "  Train Metrics: "
+                    f"P={train_detection_metrics.precision:.4f}, "
+                    f"R={train_detection_metrics.recall:.4f}, "
+                    f"mAP50={train_detection_metrics.map50:.4f}, "
+                    f"mAP50-95={train_detection_metrics.map5095:.4f}"
+                )
+                print_rank0(
+                    "  Val Metrics:   "
                     f"P={val_detection_metrics.precision:.4f}, "
                     f"R={val_detection_metrics.recall:.4f}, "
                     f"mAP50={val_detection_metrics.map50:.4f}, "
@@ -658,6 +692,7 @@ class SAM3TrainerNative:
                 stats_metrics.update(
                     {f"val/{k}": v for k, v in avg_val_components.items()}
                 )
+                stats_metrics.update(train_detection_metrics.to_dict("train_metrics"))
                 stats_metrics.update(val_detection_metrics.to_dict())
 
                 # Save models based on validation loss (only on rank 0)
@@ -692,10 +727,14 @@ class SAM3TrainerNative:
                     )
                     stats_row.update(
                         {
-                            "precision": val_detection_metrics.precision,
-                            "recall": val_detection_metrics.recall,
-                            "mAP50": val_detection_metrics.map50,
-                            "mAP50-95": val_detection_metrics.map5095,
+                            "train_precision": train_detection_metrics.precision,
+                            "train_recall": train_detection_metrics.recall,
+                            "train_mAP50": train_detection_metrics.map50,
+                            "train_mAP50-95": train_detection_metrics.map5095,
+                            "val_precision": val_detection_metrics.precision,
+                            "val_recall": val_detection_metrics.recall,
+                            "val_mAP50": val_detection_metrics.map50,
+                            "val_mAP50-95": val_detection_metrics.map5095,
                         }
                     )
                     with open(out_dir / "val_stats.json", "a") as f:
@@ -710,6 +749,13 @@ class SAM3TrainerNative:
                 print_rank0(
                     f"  Train: {self._format_loss_summary(avg_train_components)}"
                 )
+                print_rank0(
+                    "  Train Metrics: "
+                    f"P={train_detection_metrics.precision:.4f}, "
+                    f"R={train_detection_metrics.recall:.4f}, "
+                    f"mAP50={train_detection_metrics.map50:.4f}, "
+                    f"mAP50-95={train_detection_metrics.map5095:.4f}"
+                )
 
                 # No validation - just save model each epoch (only on rank 0)
                 if is_main_process():
@@ -717,6 +763,7 @@ class SAM3TrainerNative:
                     stats_metrics.update(
                         {f"train/{k}": v for k, v in avg_train_components.items()}
                     )
+                    stats_metrics.update(train_detection_metrics.to_dict("train_metrics"))
                     self.save_metrics(stats_metrics)
                     self.plot_metrics()
 

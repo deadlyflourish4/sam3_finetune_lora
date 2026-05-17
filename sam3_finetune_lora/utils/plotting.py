@@ -22,6 +22,10 @@ LOSS_COLUMNS = [
 ]
 
 METRIC_COLUMNS = [
+    "train_metrics/precision(B)",
+    "train_metrics/recall(B)",
+    "train_metrics/mAP50(B)",
+    "train_metrics/mAP50-95(B)",
     "metrics/precision(B)",
     "metrics/recall(B)",
     "metrics/mAP50(B)",
